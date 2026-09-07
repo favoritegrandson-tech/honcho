@@ -220,15 +220,16 @@ async def query_external_vector_document_ids(
     top_k: int = 5,
     max_distance: float | None = None,
     filters: dict[str, Any] | None = None,
-) -> list[str] | None:
+) -> list[tuple[str, float | None]] | None:
     """Query external vector store for document IDs sorted by similarity.
 
     No DB session needed — safe to call outside a tracked_db scope.
 
     Returns:
-        Ordered list of document IDs on the external-store path,
-        empty list when the external store has no results,
-        or None when the pgvector (DB-only) path should be used instead.
+        Ordered list of (document_id, distance) tuples on the external-store
+        path (distance is None when the store does not return it). Empty list
+        when the external store has no results, or None when the pgvector
+        (DB-only) path should be used instead.
     """
     if _uses_pgvector():
         return None
@@ -259,7 +260,7 @@ async def query_external_vector_document_ids(
     if not vector_results:
         return []
 
-    return [result.id for result in vector_results]
+    return [(result.id, result.score if result.score != 0.0 else None) for result in vector_results]
 
 
 async def fetch_documents_by_ids(
@@ -399,7 +400,7 @@ async def query_documents(
             return docs
 
     # External vector store — network call first, DB only for the ID fetch
-    document_ids = await query_external_vector_document_ids(
+    id_distance_pairs = await query_external_vector_document_ids(
         workspace_name=workspace_name,
         observer=observer,
         observed=observed,
@@ -409,8 +410,10 @@ async def query_documents(
         filters=filters,
     )
 
-    if not document_ids:
+    if not id_distance_pairs:
         return []
+
+    document_ids = [item[0] for item in id_distance_pairs]
 
     if db is not None:
         return await fetch_documents_by_ids(
@@ -446,7 +449,11 @@ def _normalize_content(content: str) -> str:
 
     The SQL normalization in ``create_documents`` must mirror this exactly.
     """
-    normalized = re.sub(r"^\[[^\]]{0,40}\]\s*", "", content.strip())
+    normalized = re.sub(
+        r"^\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s*",
+        "",
+        content.strip(),
+    )
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized.lower()
 
@@ -1251,6 +1258,8 @@ async def is_rejected_duplicate(
     # Step 1: Find potential duplicates using cosine similarity, across the
     # full loose band so the true cluster representative is found even when
     # rank-1 is a different variant (◆0816: top_k=1 missed paraphrase pairs).
+    # CRITICAL: evaluate ALL candidates, not just rank-1, because the best
+    # match for dedup purposes may be further out in the loose band.
     similar_docs = await query_documents(
         db=db,
         workspace_name=workspace_name,
@@ -1266,66 +1275,78 @@ async def is_rejected_duplicate(
     if not similar_docs:
         return SemanticRejectionResult.NOT_DUPLICATE
 
-    existing_doc = similar_docs[0]
+    # Evaluate every candidate in order of similarity; apply the first
+    # decisive action (tight-band replace/reject takes priority over loose).
+    best_tight_action: str | None = None
+    best_tight_doc: models.Document | None = None
 
-    # Tier the closest candidate. Distance unavailable (missing embedding,
-    # external vector store without distances) = treat conservatively as
-    # LOOSE: reject only when the existing row is strictly superior.
-    distance = _cosine_distance(doc.embedding, existing_doc.embedding)
-    tight_band = (
-        distance is not None
-        and distance <= settings.DERIVER.DEDUP_SEMANTIC_DISTANCE_TIGHT
-    )
+    for existing_doc in similar_docs:
+        distance = _cosine_distance(doc.embedding, existing_doc.embedding)
 
-    # Step 2: Determine which has more information using token set difference
-    tokens_new = set(embedding_client.encoding.encode(doc.content))
-    tokens_existing = set(embedding_client.encoding.encode(existing_doc.content))
-
-    unique_new = len(tokens_new - tokens_existing)
-    unique_existing = len(tokens_existing - tokens_new)
-
-    score_new = len(tokens_new) + (unique_new * 10)
-    score_existing = len(tokens_existing) + (unique_existing * 10)
-
-    # If the new document is strictly more informative, keep it and delete
-    # the existing (tight band only — loose-band similarity never soft-deletes).
-    if tight_band and score_new > score_existing:
-        logger.debug(
-            "[DUPLICATE DETECTION] Deleting existing in favor of new. new=%r, existing=%r.",
-            doc.content,
-            existing_doc.content,
+        # Tier the candidate by distance. None = conservatively LOOSE.
+        tight_band = (
+            distance is not None
+            and distance <= settings.DERIVER.DEDUP_SEMANTIC_DISTANCE_TIGHT
         )
-        # Carry the reinforcement count forward so replacing a duplicate counts as
-        # another derivation rather than resetting times_derived to 1.
-        doc.times_derived = max(doc.times_derived, existing_doc.times_derived + 1)
-        # Soft-delete the existing document - reconciliation will clean up vectors and hard-delete
-        existing_doc.deleted_at = datetime.datetime.now(datetime.timezone.utc)
-        await db.flush()
-        return (
-            SemanticRejectionResult.REPLACED_EXISTING
-        )  # Don't reject the new document
 
-    # Reject-and-reinforce when the existing row is at least as informative.
-    # Tight-band ties land here too (identical informativeness = same fact;
-    # keep the existing content and bump the count rather than soft-deleting).
-    # In the LOOSE band this is the only rejection path: nothing is ever
-    # soft-deleted for paraphrase-level similarity, so distinct adjacent
-    # facts can't be destroyed (◆0816 no-data-loss guarantee).
-    if score_existing > score_new or (tight_band and score_existing == score_new):
-        existing_doc.times_derived = func.greatest(
-            models.Document.times_derived + 1,
-            doc.times_derived,
-        )
-        await db.flush()
-        logger.debug(
-            "[DUPLICATE DETECTION] Rejecting new in favor of existing. new=%r, existing=%r.",
-            doc.content,
-            existing_doc.content,
-        )
-        return SemanticRejectionResult.REJECTED
+        # Compute informativeness score (token-set heuristic).
+        tokens_new = set(embedding_client.encoding.encode(doc.content))
+        tokens_existing = set(embedding_client.encoding.encode(existing_doc.content))
 
-    # Loose band, new content at least as informative: the overlap is treated
-    # as coincidence, not duplication. Insert normally.
+        unique_new = len(tokens_new - tokens_existing)
+        unique_existing = len(tokens_existing - tokens_new)
+
+        score_new = len(tokens_new) + (unique_new * 10)
+        score_existing = len(tokens_existing) + (unique_existing * 10)
+
+        if tight_band:
+            # Tight band: delete-in-favor-of-new (if new is superior) or
+            # reject-and-reinforce (existing >= new). This is the only path
+            # that touches the database, so we commit immediately.
+            if score_new > score_existing:
+                # Delete existing in favor of new.
+                doc.times_derived = max(doc.times_derived, existing_doc.times_derived + 1)
+                existing_doc.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                await db.flush()
+                logger.debug(
+                    "[DUPLICATE DETECTION] Deleting existing in favor of new. new=%r, existing=%r.",
+                    doc.content,
+                    existing_doc.content,
+                )
+                return SemanticRejectionResult.REPLACED_EXISTING
+            else:
+                # Reject-and-reinforce: existing is at least as informative.
+                # Tight-band ties also land here.
+                existing_doc.times_derived = func.greatest(
+                    models.Document.times_derived + 1,
+                    doc.times_derived,
+                )
+                await db.flush()
+                logger.debug(
+                    "[DUPLICATE DETECTION] Rejecting new in favor of existing. new=%r, existing=%r.",
+                    doc.content,
+                    existing_doc.content,
+                )
+                return SemanticRejectionResult.REJECTED
+        else:
+            # Loose band: never soft-delete. Reject-and-reinforce when
+            # existing is more informative; otherwise the overlap is
+            # coincidence and we continue to the next candidate.
+            if score_existing > score_new:
+                existing_doc.times_derived = func.greatest(
+                    models.Document.times_derived + 1,
+                    doc.times_derived,
+                )
+                await db.flush()
+                logger.debug(
+                    "[DUPLICATE DETECTION] Rejecting new in favor of existing (loose band). new=%r, existing=%r.",
+                    doc.content,
+                    existing_doc.content,
+                )
+                return SemanticRejectionResult.REJECTED
+
+    # All candidates evaluated: new content at least as informative as any
+    # existing row in the loose band — insert normally.
     return SemanticRejectionResult.NOT_DUPLICATE
 
 
